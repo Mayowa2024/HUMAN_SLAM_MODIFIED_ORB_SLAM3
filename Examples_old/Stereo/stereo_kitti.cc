@@ -22,6 +22,7 @@
 #include<iomanip>
 #include<chrono>
 
+#include "EventLogger.h"
 #include<opencv2/core/core.hpp>
 
 #include<System.h>
@@ -49,6 +50,9 @@ int main(int argc, char **argv)
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
     ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::STEREO,true);
+    ORB_SLAM3::EventLogger::Instance().Open("orbslam_events.csv");
+    ORB_SLAM3::EventLogger::Instance().OpenKeyframes("orbslam_keyframes.csv");
+    ORB_SLAM3::EventLogger::Instance().OpenFeatures("orbslam_features.csv");
     float imageScale = SLAM.GetImageScale();
 
     // Vector for tracking time statistics
@@ -139,6 +143,7 @@ int main(int argc, char **argv)
 
     // Stop all threads
     SLAM.Shutdown();
+    ORB_SLAM3::EventLogger::Instance().Close();
 
     // Tracking time statistics
     sort(vTimesTrack.begin(),vTimesTrack.end());

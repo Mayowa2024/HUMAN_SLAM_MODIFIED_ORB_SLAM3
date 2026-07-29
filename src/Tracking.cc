@@ -28,11 +28,13 @@
 #include "KannalaBrandt8.h"
 #include "MLPnPsolver.h"
 #include "GeometricTools.h"
+#include "EventLogger.h"
 
 #include <iostream>
 
 #include <mutex>
 #include <chrono>
+#include <unordered_map>
 
 
 using namespace std;
@@ -2162,7 +2164,76 @@ void Tracking::Track()
                 mTimeStampLost = mCurrentFrame.mTimeStamp;
             //}
         }
+                {
+    std::string stateName = "UNKNOWN";
 
+    if(mState == SYSTEM_NOT_READY)
+        stateName = "SYSTEM_NOT_READY";
+    else if(mState == NO_IMAGES_YET)
+        stateName = "NO_IMAGES_YET";
+    else if(mState == NOT_INITIALIZED)
+        stateName = "NOT_INITIALIZED";
+    else if(mState == OK)
+        stateName = "OK";
+    else if(mState == RECENTLY_LOST)
+        stateName = "RECENTLY_LOST";
+    else if(mState == LOST)
+        stateName = "LOST";
+
+    std::string trackingEvent = "TRACKING_STATUS";
+
+    if(mState == LOST)
+        trackingEvent = "TRACKING_LOST";
+    else if(mState == RECENTLY_LOST)
+        trackingEvent = "TRACKING_RECENTLY_LOST";
+    else if(mState == OK && mnMatchesInliers >= 50)
+        trackingEvent = "TRACKING_STABLE";
+    else if(mState == OK && mnMatchesInliers >= 30 && mnMatchesInliers < 50)
+        trackingEvent = "TRACKING_WEAK";
+    else if(mState == OK && mnMatchesInliers < 30)
+        trackingEvent = "LOW_INLIERS";
+
+    EventLogger::Instance().LogEvent(
+        mCurrentFrame.mnId,
+        mCurrentFrame.mTimeStamp,
+        "Tracking",
+        trackingEvent,
+        mState,
+        stateName,
+        mpReferenceKF ? mpReferenceKF->mnId : -1,
+        -1,
+        mnMatchesInliers,
+        "bOK=" + std::to_string(bOK ? 1 : 0)
+    );
+
+}
+    for(int i = 0; i < mCurrentFrame.N; i++)
+{
+    MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
+
+    bool hasMapPoint = pMP && !pMP->isBad();
+    bool isOutlier = mCurrentFrame.mvbOutlier[i];
+
+    // Keep file size manageable:
+    // log only features that are associated with map points or marked as outliers.
+    if(!hasMapPoint && !isOutlier)
+        continue;
+
+    const cv::KeyPoint& kp = mCurrentFrame.mvKeysUn[i];
+
+    EventLogger::Instance().LogFeature(
+        mCurrentFrame.mnId,
+        mCurrentFrame.mTimeStamp,
+        i,
+        kp.pt.x,
+        kp.pt.y,
+        kp.octave,
+        kp.response,
+        hasMapPoint ? 1 : 0,
+        isOutlier ? 1 : 0,
+        hasMapPoint ? pMP->mnId : -1
+    );
+}
         // Save frame if recent relocalization, since they are used for IMU reset (as we are making copy, it shluld be once mCurrFrame is completely modified)
         if((mCurrentFrame.mnId<(mnLastRelocFrameId+mnFramesToResetIMU)) && (mCurrentFrame.mnId > mnFramesToResetIMU) &&
            (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && pCurrentMap->isImuInitialized())
@@ -3222,7 +3293,22 @@ void Tracking::CreateNewKeyFrame()
         return;
 
     KeyFrame* pKF = new KeyFrame(mCurrentFrame,mpAtlas->GetCurrentMap(),mpKeyFrameDB);
+    int trackedMapPoints = 0;
 
+    for(int i = 0; i < mCurrentFrame.N; i++)
+{
+    if(mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i])
+        trackedMapPoints++;
+}
+
+   EventLogger::Instance().LogKeyFrame(
+    pKF->mnId,
+    pKF->mnFrameId,
+    pKF->mTimeStamp,
+    mnMatchesInliers,
+    mCurrentFrame.N,
+    trackedMapPoints
+);
     if(mpAtlas->isImuInitialized()) //  || mpLocalMapper->IsInitializing())
         pKF->bImu = true;
 
@@ -3606,22 +3692,104 @@ void Tracking::UpdateLocalKeyFrames()
     }
 }
 
+void Tracking::SubmitSemanticCandidates(
+    long unsigned int queryFrameId,
+    const std::vector<SemanticCandidate> &candidates)
+{
+    std::lock_guard<std::mutex> lock(mMutexSemanticCandidates);
+    mSemanticQueryFrameId = queryFrameId;
+    mPendingSemanticCandidates = candidates;
+}
+
 bool Tracking::Relocalization()
 {
     Verbose::PrintMess("Starting relocalization", Verbose::VERBOSITY_NORMAL);
+    EventLogger::Instance().Log(
+    mCurrentFrame.mnId,
+    mCurrentFrame.mTimeStamp,
+    "Tracking",
+    "RELOCALIZATION_ATTEMPT",
+    "Starting BoW relocalization"
+    );
     // Compute Bag of Words Vector
     mCurrentFrame.ComputeBoW();
 
-    // Relocalization is performed when tracking is lost
-    // Track Lost: Query KeyFrame Database for keyframe candidates for relocalisation
-    vector<KeyFrame*> vpCandidateKFs = mpKeyFrameDB->DetectRelocalizationCandidates(&mCurrentFrame, mpAtlas->GetCurrentMap());
+    // HumanSLAM answers asynchronously, so a response for a recently lost
+    // frame is applied to the next frame that still requires relocalisation.
+    std::vector<SemanticCandidate> semanticRequests;
+    long unsigned int semanticQueryFrameId = 0;
+    {
+        std::lock_guard<std::mutex> lock(mMutexSemanticCandidates);
+        semanticQueryFrameId = mSemanticQueryFrameId;
+        semanticRequests.swap(mPendingSemanticCandidates);
+    }
+
+    vector<KeyFrame*> vpCandidateKFs;
+    std::unordered_map<KeyFrame*, float> semanticScores;
+    const bool semanticResponseIsFresh =
+        !semanticRequests.empty() &&
+        mCurrentFrame.mnId >= semanticQueryFrameId &&
+        mCurrentFrame.mnId - semanticQueryFrameId <= 30;
+
+    if(semanticResponseIsFresh)
+    {
+        const vector<Map*> maps = mpAtlas->GetAllMaps();
+        for(const SemanticCandidate &request : semanticRequests)
+        {
+            for(Map* map : maps)
+            {
+                if(!map || map->GetId() != request.mapId)
+                    continue;
+                const vector<KeyFrame*> keyFrames = map->GetAllKeyFrames();
+                for(KeyFrame* keyFrame : keyFrames)
+                {
+                    if(keyFrame && !keyFrame->isBad() &&
+                       keyFrame->mnId == request.keyFrameId)
+                    {
+                        vpCandidateKFs.push_back(keyFrame);
+                        semanticScores[keyFrame] = request.score;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        cout << "HumanSLAM supplied " << vpCandidateKFs.size()
+             << " valid candidate(s) for query frame "
+             << semanticQueryFrameId << endl;
+    }
+
+    // Preserve ORB-SLAM3's standard BoW relocalisation as a fallback.
+    const vector<KeyFrame*> bowCandidates =
+        mpKeyFrameDB->DetectRelocalizationCandidates(
+            &mCurrentFrame, mpAtlas->GetCurrentMap());
+    for(KeyFrame* keyFrame : bowCandidates)
+    {
+        if(std::find(vpCandidateKFs.begin(), vpCandidateKFs.end(), keyFrame) ==
+           vpCandidateKFs.end())
+            vpCandidateKFs.push_back(keyFrame);
+    }
 
     if(vpCandidateKFs.empty()) {
         Verbose::PrintMess("There are not candidates", Verbose::VERBOSITY_NORMAL);
+        EventLogger::Instance().Log(
+        mCurrentFrame.mnId,
+        mCurrentFrame.mTimeStamp,
+        "Tracking",
+        "RELOCALIZATION_NO_CANDIDATES",
+        "No semantic or BoW candidate keyframes found"
+       );
         return false;
     }
 
     const int nKFs = vpCandidateKFs.size();
+    EventLogger::Instance().Log(
+    mCurrentFrame.mnId,
+    mCurrentFrame.mTimeStamp,
+    "Tracking",
+    "RELOCALIZATION_CANDIDATES",
+    "candidate_kfs=" + std::to_string(nKFs)
+    );
 
     // We perform first an ORB matching with each candidate
     // If enough matches are found we setup a PnP solver
@@ -3635,12 +3803,23 @@ bool Tracking::Relocalization()
 
     vector<bool> vbDiscarded;
     vbDiscarded.resize(nKFs);
+    vector<int> vRequiredInliers(nKFs, 50);
+    vector<float> vSemanticScores(nKFs, 0.0f);
 
     int nCandidates=0;
 
     for(int i=0; i<nKFs; i++)
     {
         KeyFrame* pKF = vpCandidateKFs[i];
+        const auto semanticIt = semanticScores.find(pKF);
+        if(semanticIt != semanticScores.end())
+        {
+            vSemanticScores[i] = semanticIt->second;
+            vRequiredInliers[i] = std::max(
+                30,
+                static_cast<int>(
+                    std::round(50.0f - 20.0f * semanticIt->second)));
+        }
         if(pKF->isBad())
             vbDiscarded[i] = true;
         else
@@ -3664,6 +3843,8 @@ bool Tracking::Relocalization()
     // Alternatively perform some iterations of P4P RANSAC
     // Until we found a camera pose supported by enough inliers
     bool bMatch = false;
+    KeyFrame* pMatchedKeyFrame = nullptr;
+    float matchedSemanticScore = 0.0f;
     ORBmatcher matcher2(0.9,true);
 
     while(nCandidates>0 && !bMatch)
@@ -3672,6 +3853,7 @@ bool Tracking::Relocalization()
         {
             if(vbDiscarded[i])
                 continue;
+            const int requiredInliers = vRequiredInliers[i];
 
             // Perform 5 Ransac Iterations
             vector<bool> vbInliers;
@@ -3721,17 +3903,17 @@ bool Tracking::Relocalization()
                         mCurrentFrame.mvpMapPoints[io]=static_cast<MapPoint*>(NULL);
 
                 // If few inliers, search by projection in a coarse window and optimize again
-                if(nGood<50)
+                if(nGood<requiredInliers)
                 {
                     int nadditional =matcher2.SearchByProjection(mCurrentFrame,vpCandidateKFs[i],sFound,10,100);
 
-                    if(nadditional+nGood>=50)
+                    if(nadditional+nGood>=requiredInliers)
                     {
                         nGood = Optimizer::PoseOptimization(&mCurrentFrame);
 
                         // If many inliers but still not enough, search by projection again in a narrower window
                         // the camera has been already optimized with many points
-                        if(nGood>30 && nGood<50)
+                        if(nGood>10 && nGood<requiredInliers)
                         {
                             sFound.clear();
                             for(int ip =0; ip<mCurrentFrame.N; ip++)
@@ -3740,7 +3922,7 @@ bool Tracking::Relocalization()
                             nadditional =matcher2.SearchByProjection(mCurrentFrame,vpCandidateKFs[i],sFound,3,64);
 
                             // Final optimization
-                            if(nGood+nadditional>=50)
+                            if(nGood+nadditional>=requiredInliers)
                             {
                                 nGood = Optimizer::PoseOptimization(&mCurrentFrame);
 
@@ -3754,9 +3936,11 @@ bool Tracking::Relocalization()
 
 
                 // If the pose is supported by enough inliers stop ransacs and continue
-                if(nGood>=50)
+                if(nGood>=requiredInliers)
                 {
                     bMatch = true;
+                    pMatchedKeyFrame = vpCandidateKFs[i];
+                    matchedSemanticScore = vSemanticScores[i];
                     break;
                 }
             }
@@ -3764,13 +3948,38 @@ bool Tracking::Relocalization()
     }
 
     if(!bMatch)
-    {
+    {EventLogger::Instance().Log(
+        mCurrentFrame.mnId,
+        mCurrentFrame.mTimeStamp,
+        "Tracking",
+        "RELOCALIZATION_FAILED",
+        "PnP/RANSAC failed to relocalize"
+      );
         return false;
     }
     else
     {
+        if(pMatchedKeyFrame)
+        {
+            Map* matchedMap = pMatchedKeyFrame->GetMap();
+            if(matchedMap && matchedMap != mpAtlas->GetCurrentMap())
+                mpAtlas->ChangeMap(matchedMap);
+            mpReferenceKF = pMatchedKeyFrame;
+            mCurrentFrame.mpReferenceKF = pMatchedKeyFrame;
+        }
         mnLastRelocFrameId = mCurrentFrame.mnId;
-        cout << "Relocalized!!" << endl;
+        if(matchedSemanticScore > 0.0f)
+            cout << "HumanSLAM relocalisation successful (semantic score "
+                 << matchedSemanticScore << ")" << endl;
+        else
+            cout << "Relocalized!!" << endl;
+        EventLogger::Instance().Log(
+        mCurrentFrame.mnId,
+        mCurrentFrame.mTimeStamp,
+        "Tracking",
+        "RELOCALIZATION_SUCCESS",
+        "mnLastRelocFrameId=" + std::to_string(mnLastRelocFrameId)
+        );
         return true;
     }
 

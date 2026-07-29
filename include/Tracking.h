@@ -102,6 +102,17 @@ public:
     int GetNumberDataset();
     int GetMatchesInliers();
 
+    struct SemanticCandidate
+    {
+        long unsigned int mapId = 0;
+        long unsigned int keyFrameId = 0;
+        float score = 0.0f;
+    };
+
+    void SubmitSemanticCandidates(
+        long unsigned int queryFrameId,
+        const std::vector<SemanticCandidate> &candidates);
+
     //DEBUG
     void SaveSubTrajectory(string strNameFile_frames, string strNameFile_kf, string strFolder="");
     void SaveSubTrajectory(string strNameFile_frames, string strNameFile_kf, Map* pMap);
@@ -212,6 +223,10 @@ protected:
     bool PredictStateIMU();
 
     bool Relocalization();
+
+    std::mutex mMutexSemanticCandidates;
+    long unsigned int mSemanticQueryFrameId = 0;
+    std::vector<SemanticCandidate> mPendingSemanticCandidates;
 
     void UpdateLocalMap();
     void UpdateLocalPoints();

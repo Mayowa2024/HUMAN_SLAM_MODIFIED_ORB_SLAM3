@@ -63,6 +63,12 @@ public:
 
     void InsertKeyFrame(KeyFrame *pKF);
 
+    void SubmitSemanticMergeCandidates(
+        long unsigned int queryKeyFrameId,
+        const std::vector<long unsigned int> &mapIds,
+        const std::vector<long unsigned int> &keyFrameIds,
+        const std::vector<float> &scores);
+
     void RequestReset();
     void RequestResetActiveMap(Map* pMap);
 
@@ -167,6 +173,17 @@ protected:
     std::list<KeyFrame*> mlpLoopKeyFrameQueue;
 
     std::mutex mMutexLoopQueue;
+
+    struct SemanticMergeProposal
+    {
+        long unsigned int queryKeyFrameId;
+        std::vector<long unsigned int> mapIds;
+        std::vector<long unsigned int> keyFrameIds;
+        std::vector<float> scores;
+    };
+    std::list<SemanticMergeProposal> mlSemanticMergeProposals;
+    std::mutex mMutexSemanticMerge;
+    bool mbSemanticMergeInProgress;
 
     // Loop detector parameters
     float mnCovisibilityConsistencyTh;

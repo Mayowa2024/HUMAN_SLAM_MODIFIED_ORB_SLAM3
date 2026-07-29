@@ -1324,6 +1324,55 @@ int System::GetTrackingState()
     return mTrackingState;
 }
 
+System::SemanticTrackingSnapshot System::GetSemanticTrackingSnapshot()
+{
+    unique_lock<mutex> lock(mMutexState);
+
+    SemanticTrackingSnapshot snapshot;
+    snapshot.frameId = mpTracker->mCurrentFrame.mnId;
+    snapshot.trackingState = mTrackingState;
+    snapshot.trackingInliers = mpTracker->GetMatchesInliers();
+
+    KeyFrame* pLastKeyFrame = mpTracker->GetLastKeyFrame();
+    if(pLastKeyFrame && !pLastKeyFrame->isBad())
+    {
+        snapshot.hasReferenceKeyFrame = true;
+        snapshot.referenceKeyFrameId = pLastKeyFrame->mnId;
+
+        Map* pMap = pLastKeyFrame->GetMap();
+        if(pMap)
+            snapshot.mapId = pMap->GetId();
+    }
+
+    return snapshot;
+}
+
+void System::SubmitSemanticCandidates(
+    long unsigned int queryFrameId,
+    long unsigned int queryReferenceKeyFrameId,
+    const std::vector<long unsigned int> &mapIds,
+    const std::vector<long unsigned int> &keyFrameIds,
+    const std::vector<float> &scores)
+{
+    if(mapIds.size() != keyFrameIds.size() ||
+       scores.size() != keyFrameIds.size())
+        return;
+
+    std::vector<Tracking::SemanticCandidate> candidates;
+    candidates.reserve(keyFrameIds.size());
+    for(size_t i = 0; i < keyFrameIds.size(); ++i)
+    {
+        Tracking::SemanticCandidate candidate;
+        candidate.mapId = mapIds[i];
+        candidate.keyFrameId = keyFrameIds[i];
+        candidate.score = scores[i];
+        candidates.push_back(candidate);
+    }
+    mpTracker->SubmitSemanticCandidates(queryFrameId, candidates);
+    mpLoopCloser->SubmitSemanticMergeCandidates(
+        queryReferenceKeyFrameId, mapIds, keyFrameIds, scores);
+}
+
 vector<MapPoint*> System::GetTrackedMapPoints()
 {
     unique_lock<mutex> lock(mMutexState);
@@ -1546,4 +1595,3 @@ string System::CalculateCheckSum(string filename, int type)
 }
 
 } //namespace ORB_SLAM
-

@@ -101,6 +101,16 @@ public:
 
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    struct SemanticTrackingSnapshot
+    {
+        long unsigned int frameId = 0;
+        long unsigned int referenceKeyFrameId = 0;
+        long unsigned int mapId = 0;
+        int trackingState = 0;
+        int trackingInliers = 0;
+        bool hasReferenceKeyFrame = false;
+    };
     // Initialize the SLAM system. It launches the Local Mapping, Loop Closing and Viewer threads.
     System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor, const bool bUseViewer = true, const int initFr = 0, const string &strSequence = std::string());
 
@@ -176,6 +186,13 @@ public:
     int GetTrackingState();
     std::vector<MapPoint*> GetTrackedMapPoints();
     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
+    SemanticTrackingSnapshot GetSemanticTrackingSnapshot();
+    void SubmitSemanticCandidates(
+        long unsigned int queryFrameId,
+        long unsigned int queryReferenceKeyFrameId,
+        const std::vector<long unsigned int> &mapIds,
+        const std::vector<long unsigned int> &keyFrameIds,
+        const std::vector<float> &scores);
 
     // For debugging
     double GetTimeFromIMUInit();

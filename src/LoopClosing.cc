@@ -24,6 +24,7 @@
 #include "Optimizer.h"
 #include "ORBmatcher.h"
 #include "G2oTypes.h"
+#include "EventLogger.h"
 
 #include<mutex>
 #include<thread>
@@ -36,7 +37,8 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
     mbResetRequested(false), mbResetActiveMapRequested(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas),
     mpKeyFrameDB(pDB), mpORBVocabulary(pVoc), mpMatchedKF(NULL), mLastLoopKFid(0), mbRunningGBA(false), mbFinishedGBA(true),
     mbStopGBA(false), mpThreadGBA(NULL), mbFixScale(bFixScale), mnFullBAIdx(0), mnLoopNumCoincidences(0), mnMergeNumCoincidences(0),
-    mbLoopDetected(false), mbMergeDetected(false), mnLoopNumNotFound(0), mnMergeNumNotFound(0), mbActiveLC(bActiveLC)
+    mbLoopDetected(false), mbMergeDetected(false), mnLoopNumNotFound(0), mnMergeNumNotFound(0),
+    mbSemanticMergeInProgress(false), mbActiveLC(bActiveLC)
 {
     mnCovisibilityConsistencyTh = 3;
     mpLastCurrentKF = static_cast<KeyFrame*>(NULL);
@@ -86,6 +88,28 @@ void LoopClosing::SetLocalMapper(LocalMapping *pLocalMapper)
     mpLocalMapper=pLocalMapper;
 }
 
+void LoopClosing::SubmitSemanticMergeCandidates(
+    long unsigned int queryKeyFrameId,
+    const vector<long unsigned int> &mapIds,
+    const vector<long unsigned int> &keyFrameIds,
+    const vector<float> &scores)
+{
+    if(mapIds.size() != keyFrameIds.size() ||
+       scores.size() != keyFrameIds.size() || keyFrameIds.empty())
+        return;
+
+    SemanticMergeProposal proposal;
+    proposal.queryKeyFrameId = queryKeyFrameId;
+    proposal.mapIds = mapIds;
+    proposal.keyFrameIds = keyFrameIds;
+    proposal.scores = scores;
+
+    unique_lock<mutex> lock(mMutexSemanticMerge);
+    mlSemanticMergeProposals.push_back(proposal);
+    while(mlSemanticMergeProposals.size() > 20)
+        mlSemanticMergeProposals.pop_front();
+}
+
 
 void LoopClosing::Run()
 {
@@ -128,6 +152,10 @@ void LoopClosing::Run()
                     }
                     else
                     {
+                        const long unsigned int currentMapId =
+                            mpCurrentKF->GetMap()->GetId();
+                        const long unsigned int matchedMapId =
+                            mpMergeMatchedKF->GetMap()->GetId();
                         Sophus::SE3d mTmw = mpMergeMatchedKF->GetPose().cast<double>();
                         g2o::Sim3 gSmw2(mTmw.unit_quaternion(), mTmw.translation(), 1.0);
                         Sophus::SE3d mTcw = mpCurrentKF->GetPose().cast<double>();
@@ -190,6 +218,12 @@ void LoopClosing::Run()
 #endif
 
                         Verbose::PrintMess("Merge finished!", Verbose::VERBOSITY_QUIET);
+                        if(mbSemanticMergeInProgress)
+                        {
+                            cout << "HumanSLAM map fusion successful: map "
+                                 << currentMapId << " fused with map "
+                                 << matchedMapId << endl;
+                        }
                     }
 
                     vdPR_CurrentTime.push_back(mpCurrentKF->mTimeStamp);
@@ -204,6 +238,7 @@ void LoopClosing::Run()
                     mvpMergeMPs.clear();
                     mnMergeNumNotFound = 0;
                     mbMergeDetected = false;
+                    mbSemanticMergeInProgress = false;
 
                     if(mbLoopDetected)
                     {
@@ -227,6 +262,14 @@ void LoopClosing::Run()
                     vnPR_TypeRecogn.push_back(0);
 
                     Verbose::PrintMess("*Loop detected", Verbose::VERBOSITY_QUIET);
+                    EventLogger::Instance().Log(
+                     mpCurrentKF ? mpCurrentKF->mnFrameId : -1,
+                     mpCurrentKF ? mpCurrentKF->mTimeStamp : -1.0,
+                     "LoopClosing",
+                     "LOOP_DETECTED",
+                     "current_kf=" + std::to_string(mpCurrentKF ? mpCurrentKF->mnId : -1) +
+                     "; matched_kf=" + std::to_string(mpLoopMatchedKF ? mpLoopMatchedKF->mnId : -1)
+                     );
 
                     mg2oLoopScw = mg2oLoopSlw; //*mvg2oSim3LoopTcw[nCurrentIndex];
                     if(mpCurrentKF->GetMap()->IsInertial())
@@ -272,6 +315,13 @@ void LoopClosing::Run()
 
 #endif
                         CorrectLoop();
+EventLogger::Instance().Log(
+    mpCurrentKF ? mpCurrentKF->mnFrameId : -1,
+    mpCurrentKF ? mpCurrentKF->mTimeStamp : -1.0,
+    "LoopClosing",
+    "LOOP_CORRECTED",
+    "Loop correction completed"
+);
 #ifdef REGISTER_TIMES
                         std::chrono::steady_clock::time_point time_EndLoop = std::chrono::steady_clock::now();
 
@@ -497,6 +547,88 @@ bool LoopClosing::NewDetectCommonRegions()
 #endif
     }
 
+    // HumanSLAM proposes cross-map places; ORB-SLAM3 still performs its normal
+    // feature matching, Sim3 estimation and temporal consistency checks.
+    vector<KeyFrame*> vpSemanticMergeCand;
+    {
+        unique_lock<mutex> lock(mMutexSemanticMerge);
+        const vector<Map*> allMaps = mpAtlas->GetAllMaps();
+        for(auto proposalIt = mlSemanticMergeProposals.begin();
+            proposalIt != mlSemanticMergeProposals.end();)
+        {
+            KeyFrame* pQueryKF = nullptr;
+            for(Map* pMap : allMaps)
+            {
+                for(KeyFrame* pKF : pMap->GetAllKeyFrames())
+                {
+                    if(pKF && !pKF->isBad() &&
+                       pKF->mnId == proposalIt->queryKeyFrameId)
+                    {
+                        pQueryKF = pKF;
+                        break;
+                    }
+                }
+                if(pQueryKF)
+                    break;
+            }
+
+            const bool sameMap = pQueryKF &&
+                pQueryKF->GetMap() == mpCurrentKF->GetMap();
+            const bool fresh = sameMap &&
+                mpCurrentKF->mnId >= pQueryKF->mnId &&
+                mpCurrentKF->mnId - pQueryKF->mnId <= 5;
+
+            if(fresh)
+            {
+                for(size_t i = 0; i < proposalIt->keyFrameIds.size(); ++i)
+                {
+                    for(Map* pMap : allMaps)
+                    {
+                        if(!pMap || pMap == mpCurrentKF->GetMap() ||
+                           pMap->GetId() != proposalIt->mapIds[i])
+                            continue;
+                        for(KeyFrame* pKF : pMap->GetAllKeyFrames())
+                        {
+                            if(pKF && !pKF->isBad() &&
+                               pKF->mnId == proposalIt->keyFrameIds[i] &&
+                               find(vpSemanticMergeCand.begin(),
+                                    vpSemanticMergeCand.end(), pKF) ==
+                                    vpSemanticMergeCand.end())
+                            {
+                                vpSemanticMergeCand.push_back(pKF);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if((sameMap && mpCurrentKF->mnId > pQueryKF->mnId + 5) ||
+               (!pQueryKF && mlSemanticMergeProposals.size() >= 20))
+                proposalIt = mlSemanticMergeProposals.erase(proposalIt);
+            else
+                ++proposalIt;
+        }
+    }
+
+    if(!vpSemanticMergeCand.empty())
+    {
+        // Semantic candidates are checked first, followed by standard BoW
+        // candidates. No geometric threshold is weakened.
+        for(auto it = vpSemanticMergeCand.rbegin();
+            it != vpSemanticMergeCand.rend(); ++it)
+        {
+            vpMergeBowCand.erase(
+                remove(vpMergeBowCand.begin(), vpMergeBowCand.end(), *it),
+                vpMergeBowCand.end());
+            vpMergeBowCand.insert(vpMergeBowCand.begin(), *it);
+        }
+        cout << "HumanSLAM map-fusion verification: current map "
+             << mpCurrentKF->GetMap()->GetId() << ", "
+             << vpSemanticMergeCand.size()
+             << " cross-map candidate(s)" << endl;
+    }
+
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_StartEstSim3_2 = std::chrono::steady_clock::now();
 #endif
@@ -510,6 +642,14 @@ bool LoopClosing::NewDetectCommonRegions()
     if(!bMergeDetectedInKF && !vpMergeBowCand.empty())
     {
         mbMergeDetected = DetectCommonRegionsFromBoW(vpMergeBowCand, mpMergeMatchedKF, mpMergeLastCurrentKF, mg2oMergeSlw, mnMergeNumCoincidences, mvpMergeMPs, mvpMergeMatchedMPs);
+        if(mnMergeNumCoincidences > 0 && !vpSemanticMergeCand.empty() &&
+           find(vpSemanticMergeCand.begin(), vpSemanticMergeCand.end(),
+                mpMergeMatchedKF) != vpSemanticMergeCand.end())
+        {
+            mbSemanticMergeInProgress = true;
+            cout << "HumanSLAM cross-map Sim3 verified; awaiting temporal consistency ("
+                 << mnMergeNumCoincidences << "/3)" << endl;
+        }
     }
 
 #ifdef REGISTER_TIMES

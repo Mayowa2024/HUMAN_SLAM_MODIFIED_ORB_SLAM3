@@ -23,6 +23,7 @@
 #include "Optimizer.h"
 #include "Converter.h"
 #include "GeometricTools.h"
+#include "EventLogger.h"
 
 #include<mutex>
 #include<chrono>
@@ -837,6 +838,13 @@ bool LocalMapping::Stop()
     {
         mbStopped = true;
         cout << "Local Mapping STOP" << endl;
+EventLogger::Instance().Log(
+    mpCurrentKeyFrame ? mpCurrentKeyFrame->mnFrameId : -1,
+    mpCurrentKeyFrame ? mpCurrentKeyFrame->mTimeStamp : -1.0,
+    "LocalMapping",
+    "LOCAL_MAPPING_STOP",
+    "Local mapping stopped"
+);
         return true;
     }
 
@@ -868,6 +876,13 @@ void LocalMapping::Release()
     mlNewKeyFrames.clear();
 
     cout << "Local Mapping RELEASE" << endl;
+EventLogger::Instance().Log(
+    mpCurrentKeyFrame ? mpCurrentKeyFrame->mnFrameId : -1,
+    mpCurrentKeyFrame ? mpCurrentKeyFrame->mTimeStamp : -1.0,
+    "LocalMapping",
+    "LOCAL_MAPPING_RELEASE",
+    "Local mapping released"
+);
 }
 
 bool LocalMapping::AcceptKeyFrames()
