@@ -163,6 +163,8 @@ public:
     list<Sophus::SE3f> mlRelativeFramePoses;
     list<KeyFrame*> mlpReferences;
     list<double> mlFrameTimes;
+    list<long unsigned int> mlFrameIds;
+    list<string> mlFrameNames;
     list<bool> mlbLost;
 
     // frames with estimated pose

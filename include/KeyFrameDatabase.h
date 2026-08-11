@@ -73,7 +73,11 @@ public:
     // Loop and Merge Detection
     void DetectCandidates(KeyFrame* pKF, float minScore,vector<KeyFrame*>& vpLoopCand, vector<KeyFrame*>& vpMergeCand);
     void DetectBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &vpLoopCand, vector<KeyFrame*> &vpMergeCand, int nMinWords);
-    void DetectNBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &vpLoopCand, vector<KeyFrame*> &vpMergeCand, int nNumCandidates);
+    void DetectNBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &vpLoopCand,
+                               vector<KeyFrame*> &vpMergeCand,
+                               int nNumCandidates,
+                               vector<float>* pvLoopScores = nullptr,
+                               vector<float>* pvMergeScores = nullptr);
 
     // Relocalization
     std::vector<KeyFrame*> DetectRelocalizationCandidates(Frame* F, Map* pMap);

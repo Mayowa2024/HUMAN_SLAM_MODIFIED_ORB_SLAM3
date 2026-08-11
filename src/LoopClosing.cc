@@ -27,6 +27,7 @@
 #include "EventLogger.h"
 
 #include<mutex>
+#include<sstream>
 #include<thread>
 
 
@@ -38,7 +39,9 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
     mpKeyFrameDB(pDB), mpORBVocabulary(pVoc), mpMatchedKF(NULL), mLastLoopKFid(0), mbRunningGBA(false), mbFinishedGBA(true),
     mbStopGBA(false), mpThreadGBA(NULL), mbFixScale(bFixScale), mnFullBAIdx(0), mnLoopNumCoincidences(0), mnMergeNumCoincidences(0),
     mbLoopDetected(false), mbMergeDetected(false), mnLoopNumNotFound(0), mnMergeNumNotFound(0),
-    mbSemanticMergeInProgress(false), mbActiveLC(bActiveLC)
+    mbSemanticMergeInProgress(false), mbSemanticLoopInProgress(false),
+    mbSemanticCandidatesOnly(false), mbLoopTimingActive(false),
+    mbActiveLC(bActiveLC)
 {
     mnCovisibilityConsistencyTh = 3;
     mpLastCurrentKF = static_cast<KeyFrame*>(NULL);
@@ -98,7 +101,7 @@ void LoopClosing::SubmitSemanticMergeCandidates(
        scores.size() != keyFrameIds.size() || keyFrameIds.empty())
         return;
 
-    SemanticMergeProposal proposal;
+    SemanticPlaceProposal proposal;
     proposal.queryKeyFrameId = queryKeyFrameId;
     proposal.mapIds = mapIds;
     proposal.keyFrameIds = keyFrameIds;
@@ -108,6 +111,15 @@ void LoopClosing::SubmitSemanticMergeCandidates(
     mlSemanticMergeProposals.push_back(proposal);
     while(mlSemanticMergeProposals.size() > 20)
         mlSemanticMergeProposals.pop_front();
+}
+
+void LoopClosing::SetSemanticCandidatesOnly(bool enabled)
+{
+    mbSemanticCandidatesOnly = enabled;
+    cout << "Loop candidate source: "
+         << (enabled ? "HumanSLAM only (native BoW disabled)"
+                     : "native ORB-SLAM3 BoW")
+         << endl;
 }
 
 
@@ -218,6 +230,21 @@ void LoopClosing::Run()
 #endif
 
                         Verbose::PrintMess("Merge finished!", Verbose::VERBOSITY_QUIET);
+                        EventLogger::Instance().Log(
+                            mpCurrentKF ? static_cast<long long>(mpCurrentKF->mnFrameId) : -1,
+                            mpCurrentKF ? mpCurrentKF->mTimeStamp : 0.0,
+                            "LoopClosing",
+                            "MAP_MERGE_SUCCESS",
+                            "source=" + std::string(mbSemanticMergeInProgress ?
+                                                     "humanslam" : "native_bow") +
+                            ";current_map=" + std::to_string(currentMapId) +
+                            ";matched_map=" + std::to_string(matchedMapId) +
+                            ";current_keyframe=" +
+                                std::to_string(mpCurrentKF ? mpCurrentKF->mnId : -1) +
+                            ";matched_keyframe=" +
+                                std::to_string(mpMergeMatchedKF ?
+                                                   mpMergeMatchedKF->mnId : -1)
+                        );
                         if(mbSemanticMergeInProgress)
                         {
                             cout << "HumanSLAM map fusion successful: map "
@@ -250,6 +277,7 @@ void LoopClosing::Run()
                         mvpLoopMPs.clear();
                         mnLoopNumNotFound = 0;
                         mbLoopDetected = false;
+                        mbLoopTimingActive = false;
                     }
 
                 }
@@ -314,7 +342,74 @@ void LoopClosing::Run()
                         nLoop += 1;
 
 #endif
+                        const Sophus::SE3f poseBeforeCorrection =
+                            mpCurrentKF->GetPose();
+                        const std::chrono::steady_clock::time_point correctionStart =
+                            std::chrono::steady_clock::now();
                         CorrectLoop();
+                        const Sophus::SE3f poseAfterCorrection =
+                            mpCurrentKF->GetPose();
+                        const Sophus::SE3f appliedCorrection =
+                            poseAfterCorrection * poseBeforeCorrection.inverse();
+                        const double correctionTranslationM =
+                            appliedCorrection.translation().norm();
+                        const double correctionRotationRad =
+                            appliedCorrection.so3().log().norm();
+                        const double correctionMs =
+                            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                std::chrono::steady_clock::now() - correctionStart).count();
+                        const double verificationMs = mbLoopTimingActive ?
+                            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                std::chrono::steady_clock::now() - mLoopTimingStart).count() : -1.0;
+                        const string loopSource = mbSemanticLoopInProgress ?
+                            mSemanticLoopSource : "native";
+                        cout << "Loop closure metrics: source=" << loopSource
+                             << "; current_frame="
+                             << (mpCurrentKF ? mpCurrentKF->mnFrameId : 0)
+                             << "; current_kf="
+                             << (mpCurrentKF ? mpCurrentKF->mnId : 0)
+                             << "; matched_kf="
+                             << (mpLoopMatchedKF ? mpLoopMatchedKF->mnId : 0)
+                             << "; matched_map_points="
+                             << mvpLoopMatchedMPs.size()
+                             << "; temporal_verification_ms=" << verificationMs
+                             << "; correction_ms=" << correctionMs
+                             << "; sim3_scale=" << mg2oLoopScw.scale()
+                             << "; applied_translation_m=" << correctionTranslationM
+                             << "; applied_rotation_rad=" << correctionRotationRad
+                             << endl;
+                        EventLogger::Instance().Log(
+                            mpCurrentKF ? mpCurrentKF->mnFrameId : -1,
+                            mpCurrentKF ? mpCurrentKF->mTimeStamp : -1.0,
+                            "LoopClosing", "LOOP_CORRECTION_METRICS",
+                            "source=" + loopSource +
+                            "; current_kf=" + std::to_string(mpCurrentKF ? mpCurrentKF->mnId : -1) +
+                            "; matched_kf=" + std::to_string(mpLoopMatchedKF ? mpLoopMatchedKF->mnId : -1) +
+                            "; matched_frame=" + std::to_string(mpLoopMatchedKF ? mpLoopMatchedKF->mnFrameId : -1) +
+                            "; matched_map_points=" + std::to_string(mvpLoopMatchedMPs.size()) +
+                            "; verification_ms=" + std::to_string(verificationMs) +
+                            "; correction_ms=" + std::to_string(correctionMs) +
+                            "; sim3_scale=" + std::to_string(mg2oLoopScw.scale()) +
+                            "; applied_translation_m=" + std::to_string(correctionTranslationM) +
+                            "; applied_rotation_rad=" + std::to_string(correctionRotationRad));
+                        mbLoopTimingActive = false;
+                        if(mbSemanticLoopInProgress)
+                        {
+                            cout << "HumanSLAM loop closure successful: current keyframe "
+                                 << mpCurrentKF->mnId << " matched keyframe "
+                                 << (mpLoopMatchedKF ? mpLoopMatchedKF->mnId : 0)
+                                 << " source=" << mSemanticLoopSource
+                                 << endl;
+                            EventLogger::Instance().Log(
+                                mpCurrentKF ? mpCurrentKF->mnFrameId : -1,
+                                mpCurrentKF ? mpCurrentKF->mTimeStamp : -1.0,
+                                "LoopClosing",
+                                "HUMANSLAM_LOOP_CLOSURE_SUCCESS",
+                                "source=" + mSemanticLoopSource +
+                                "; matched_kf=" +
+                                    std::to_string(mpLoopMatchedKF ?
+                                        mpLoopMatchedKF->mnId : 0));
+                        }
 EventLogger::Instance().Log(
     mpCurrentKF ? mpCurrentKF->mnFrameId : -1,
     mpCurrentKF ? mpCurrentKF->mTimeStamp : -1.0,
@@ -340,6 +435,8 @@ EventLogger::Instance().Log(
                     mvpLoopMPs.clear();
                     mnLoopNumNotFound = 0;
                     mbLoopDetected = false;
+                    mbSemanticLoopInProgress = false;
+                    mbLoopTimingActive = false;
                 }
 
             }
@@ -446,6 +543,26 @@ bool LoopClosing::NewDetectCommonRegions()
             mbLoopDetected = mnLoopNumCoincidences >= 3;
             mnLoopNumNotFound = 0;
 
+            if(mbSemanticLoopInProgress)
+            {
+                const string detail =
+                    "source=" + mSemanticLoopSource +
+                    "; selected_kf=" +
+                        std::to_string(mpLoopMatchedKF ?
+                            mpLoopMatchedKF->mnId : 0) +
+                    "; matched_map_points=" +
+                        std::to_string(mvpLoopMatchedMPs.size()) +
+                    "; temporal_consistency=" +
+                        std::to_string(mnLoopNumCoincidences) + "/3";
+                cout << "HumanSLAM temporal verification; " << detail << endl;
+                EventLogger::Instance().Log(
+                    mpCurrentKF ? mpCurrentKF->mnFrameId : -1,
+                    mpCurrentKF ? mpCurrentKF->mTimeStamp : -1.0,
+                    "LoopClosing",
+                    "HUMANSLAM_TEMPORAL_VERIFICATION",
+                    detail);
+            }
+
             if(!mbLoopDetected)
             {
                 cout << "PR: Loop detected with Reffine Sim3" << endl;
@@ -464,6 +581,8 @@ bool LoopClosing::NewDetectCommonRegions()
                 mvpLoopMatchedMPs.clear();
                 mvpLoopMPs.clear();
                 mnLoopNumNotFound = 0;
+                mbSemanticLoopInProgress = false;
+                mbLoopTimingActive = false;
             }
 
         }
@@ -532,13 +651,59 @@ bool LoopClosing::NewDetectCommonRegions()
 
     // Extract candidates from the bag of words
     vector<KeyFrame*> vpMergeBowCand, vpLoopBowCand;
-    if(!bMergeDetectedInKF || !bLoopDetectedInKF)
+    vector<float> vMergeBowScores, vLoopBowScores;
+    double nativeRetrievalMs = -1.0;
+    if(!mbSemanticCandidatesOnly &&
+       (!bMergeDetectedInKF || !bLoopDetectedInKF))
     {
         // Search in BoW
+        const std::chrono::steady_clock::time_point nativeRetrievalStart =
+            std::chrono::steady_clock::now();
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_StartQuery = std::chrono::steady_clock::now();
 #endif
-        mpKeyFrameDB->DetectNBestCandidates(mpCurrentKF, vpLoopBowCand, vpMergeBowCand,3);
+        // Retrieve five for Recall@5 evaluation, but retain the historical
+        // operational top-three below so instrumentation does not change SLAM.
+        mpKeyFrameDB->DetectNBestCandidates(
+            mpCurrentKF, vpLoopBowCand, vpMergeBowCand, 5,
+            &vLoopBowScores, &vMergeBowScores);
+        nativeRetrievalMs =
+            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                std::chrono::steady_clock::now() - nativeRetrievalStart).count();
+        for(size_t i = 0; i < vpLoopBowCand.size(); ++i)
+        {
+            KeyFrame* candidate = vpLoopBowCand[i];
+            const string detail =
+                "source=native_bow; stage=raw_shortlist; query_kf=" +
+                std::to_string(mpCurrentKF->mnId) +
+                "; query_frame=" + std::to_string(mpCurrentKF->mnFrameId) +
+                "; rank=" + std::to_string(i + 1) +
+                "; candidate_kf=" + std::to_string(candidate->mnId) +
+                "; candidate_frame=" + std::to_string(candidate->mnFrameId) +
+                "; candidate_map=" + std::to_string(candidate->GetMap()->GetId()) +
+                "; retrieval_score=" + std::to_string(vLoopBowScores[i]) +
+                "; retrieval_ms=" + std::to_string(nativeRetrievalMs);
+            EventLogger::Instance().Log(
+                mpCurrentKF->mnFrameId, mpCurrentKF->mTimeStamp,
+                "LoopClosing", "RETRIEVAL_CANDIDATE", detail);
+        }
+        if(vpLoopBowCand.empty())
+        {
+            EventLogger::Instance().Log(
+                mpCurrentKF->mnFrameId, mpCurrentKF->mTimeStamp,
+                "LoopClosing", "RETRIEVAL_EMPTY",
+                "source=native_bow; query_kf=" +
+                    std::to_string(mpCurrentKF->mnId) +
+                "; retrieval_ms=" + std::to_string(nativeRetrievalMs));
+        }
+        if(vpLoopBowCand.size() > 3)
+            vpLoopBowCand.resize(3);
+        if(vLoopBowScores.size() > 3)
+            vLoopBowScores.resize(3);
+        if(vpMergeBowCand.size() > 3)
+            vpMergeBowCand.resize(3);
+        if(vMergeBowScores.size() > 3)
+            vMergeBowScores.resize(3);
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_EndQuery = std::chrono::steady_clock::now();
 
@@ -547,9 +712,18 @@ bool LoopClosing::NewDetectCommonRegions()
 #endif
     }
 
-    // HumanSLAM proposes cross-map places; ORB-SLAM3 still performs its normal
+    // Preserve native BoW provenance before semantic candidates are merged.
+    // ORB-SLAM3 may geometrically select a covisible neighbour of a proposed
+    // root keyframe, so provenance must cover the same neighbourhood searched
+    // by DetectCommonRegionsFromBoW rather than relying on exact pointer equality.
+    const vector<KeyFrame*> vpNativeLoopRoots = vpLoopBowCand;
+
+    // HumanSLAM proposes places in both the current map (loop closure) and
+    // another Atlas map (map fusion). ORB-SLAM3 still performs its normal
     // feature matching, Sim3 estimation and temporal consistency checks.
+    vector<KeyFrame*> vpSemanticLoopCand;
     vector<KeyFrame*> vpSemanticMergeCand;
+    map<KeyFrame*, pair<float, int>> mSemanticCandidateMetadata;
     {
         unique_lock<mutex> lock(mMutexSemanticMerge);
         const vector<Map*> allMaps = mpAtlas->GetAllMaps();
@@ -584,20 +758,34 @@ bool LoopClosing::NewDetectCommonRegions()
                 {
                     for(Map* pMap : allMaps)
                     {
-                        if(!pMap || pMap == mpCurrentKF->GetMap() ||
-                           pMap->GetId() != proposalIt->mapIds[i])
+                        if(!pMap || pMap->GetId() != proposalIt->mapIds[i])
                             continue;
                         for(KeyFrame* pKF : pMap->GetAllKeyFrames())
                         {
-                            if(pKF && !pKF->isBad() &&
-                               pKF->mnId == proposalIt->keyFrameIds[i] &&
-                               find(vpSemanticMergeCand.begin(),
-                                    vpSemanticMergeCand.end(), pKF) ==
-                                    vpSemanticMergeCand.end())
+                            if(!pKF || pKF->isBad() ||
+                               pKF->mnId != proposalIt->keyFrameIds[i])
+                                continue;
+
+                            if(pMap == mpCurrentKF->GetMap())
                             {
-                                vpSemanticMergeCand.push_back(pKF);
-                                break;
+                                // Defence in depth against local/covisible
+                                // matches accidentally being proposed as loops.
+                                if(mpCurrentKF->mnId > pKF->mnId + 10 &&
+                                   find(vpSemanticLoopCand.begin(),
+                                        vpSemanticLoopCand.end(), pKF) ==
+                                        vpSemanticLoopCand.end())
+                                {
+                                    vpSemanticLoopCand.push_back(pKF);
+                                    mSemanticCandidateMetadata[pKF] =
+                                        make_pair(proposalIt->scores[i],
+                                                  static_cast<int>(i + 1));
+                                }
                             }
+                            else if(find(vpSemanticMergeCand.begin(),
+                                         vpSemanticMergeCand.end(), pKF) ==
+                                         vpSemanticMergeCand.end())
+                                vpSemanticMergeCand.push_back(pKF);
+                            break;
                         }
                     }
                 }
@@ -610,6 +798,58 @@ bool LoopClosing::NewDetectCommonRegions()
                 ++proposalIt;
         }
     }
+
+    if(!vpSemanticLoopCand.empty())
+    {
+        for(KeyFrame* candidate : vpSemanticLoopCand)
+        {
+            const pair<float, int> metadata =
+                mSemanticCandidateMetadata[candidate];
+            const string detail =
+                "source=semantic; stage=raw_shortlist; query_kf=" +
+                std::to_string(mpCurrentKF->mnId) +
+                "; query_frame=" + std::to_string(mpCurrentKF->mnFrameId) +
+                "; rank=" + std::to_string(metadata.second) +
+                "; candidate_kf=" + std::to_string(candidate->mnId) +
+                "; candidate_frame=" + std::to_string(candidate->mnFrameId) +
+                "; candidate_map=" + std::to_string(candidate->GetMap()->GetId()) +
+                "; retrieval_score=" + std::to_string(metadata.first);
+            EventLogger::Instance().Log(
+                mpCurrentKF->mnFrameId, mpCurrentKF->mTimeStamp,
+                "LoopClosing", "RETRIEVAL_CANDIDATE", detail);
+        }
+        for(auto it = vpSemanticLoopCand.rbegin();
+            it != vpSemanticLoopCand.rend(); ++it)
+        {
+            vpLoopBowCand.erase(
+                remove(vpLoopBowCand.begin(), vpLoopBowCand.end(), *it),
+                vpLoopBowCand.end());
+            vpLoopBowCand.insert(vpLoopBowCand.begin(), *it);
+        }
+        cout << "HumanSLAM loop verification: current map "
+             << mpCurrentKF->GetMap()->GetId() << ", "
+             << vpSemanticLoopCand.size()
+             << " same-map candidate(s)" << endl;
+    }
+
+    auto expandLoopCandidateNeighbourhood = [](const vector<KeyFrame*> &roots)
+    {
+        set<KeyFrame*> expanded;
+        for(KeyFrame* root : roots)
+        {
+            if(!root || root->isBad())
+                continue;
+            expanded.insert(root);
+            const vector<KeyFrame*> neighbours =
+                root->GetBestCovisibilityKeyFrames(10);
+            for(KeyFrame* neighbour : neighbours)
+            {
+                if(neighbour && !neighbour->isBad())
+                    expanded.insert(neighbour);
+            }
+        }
+        return expanded;
+    };
 
     if(!vpSemanticMergeCand.empty())
     {
@@ -636,7 +876,81 @@ bool LoopClosing::NewDetectCommonRegions()
     //Loop candidates
     if(!bLoopDetectedInKF && !vpLoopBowCand.empty())
     {
+        const int previousLoopCoincidences = mnLoopNumCoincidences;
+        const std::chrono::steady_clock::time_point geometryStart =
+            std::chrono::steady_clock::now();
         mbLoopDetected = DetectCommonRegionsFromBoW(vpLoopBowCand, mpLoopMatchedKF, mpLoopLastCurrentKF, mg2oLoopSlw, mnLoopNumCoincidences, mvpLoopMPs, mvpLoopMatchedMPs);
+        const double geometryMs =
+            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                std::chrono::steady_clock::now() - geometryStart).count();
+        const bool seedAccepted =
+            previousLoopCoincidences == 0 && mnLoopNumCoincidences > 0;
+        EventLogger::Instance().Log(
+            mpCurrentKF->mnFrameId, mpCurrentKF->mTimeStamp,
+            "LoopClosing", "RETRIEVAL_GEOMETRIC_RESULT",
+            "source=" + string(vpSemanticLoopCand.empty() ? "native_bow" : "semantic") +
+            "; query_kf=" + std::to_string(mpCurrentKF->mnId) +
+            "; accepted_seed=" + std::to_string(seedAccepted ? 1 : 0) +
+            "; matched_kf=" + std::to_string(mpLoopMatchedKF ? mpLoopMatchedKF->mnId : -1) +
+            "; matched_frame=" + std::to_string(mpLoopMatchedKF ? mpLoopMatchedKF->mnFrameId : -1) +
+            "; matched_map_points=" + std::to_string(mvpLoopMatchedMPs.size()) +
+            "; temporal_consistency=" + std::to_string(mnLoopNumCoincidences) +
+            "; geometry_ms=" + std::to_string(geometryMs));
+        if(previousLoopCoincidences == 0 && mnLoopNumCoincidences > 0)
+        {
+            mLoopTimingStart = std::chrono::steady_clock::now();
+            mbLoopTimingActive = true;
+        }
+        // Resolve provenance only after ORB-SLAM3 has completed geometric
+        // verification. Doing covisibility traversal before Sim3 estimation
+        // perturbs this highly timing-sensitive path and can expose NaNs in
+        // ORB-SLAM3's concurrent optimiser.
+        const set<KeyFrame*> spNativeLoopProvenance =
+            expandLoopCandidateNeighbourhood(vpNativeLoopRoots);
+        const set<KeyFrame*> spSemanticLoopProvenance =
+            expandLoopCandidateNeighbourhood(vpSemanticLoopCand);
+        const bool semanticMatch = mnLoopNumCoincidences > 0 &&
+            mpLoopMatchedKF &&
+            spSemanticLoopProvenance.find(mpLoopMatchedKF) !=
+                spSemanticLoopProvenance.end();
+        const bool nativeMatch = mnLoopNumCoincidences > 0 &&
+            mpLoopMatchedKF &&
+            spNativeLoopProvenance.find(mpLoopMatchedKF) !=
+                spNativeLoopProvenance.end();
+        if(semanticMatch)
+        {
+            mbSemanticLoopInProgress = true;
+            mSemanticLoopSource = nativeMatch ? "both" : "semantic";
+            mvSemanticLoopRootIds.clear();
+            for(KeyFrame* root : vpSemanticLoopCand)
+            {
+                if(root && !root->isBad())
+                    mvSemanticLoopRootIds.push_back(root->mnId);
+            }
+
+            ostringstream roots;
+            for(size_t i = 0; i < mvSemanticLoopRootIds.size(); ++i)
+            {
+                if(i > 0)
+                    roots << ",";
+                roots << mvSemanticLoopRootIds[i];
+            }
+            const string detail =
+                "source=" + mSemanticLoopSource +
+                "; selected_kf=" + std::to_string(mpLoopMatchedKF->mnId) +
+                "; semantic_root_kfs=" + roots.str() +
+                "; matched_map_points=" +
+                    std::to_string(mvpLoopMatchedMPs.size()) +
+                "; temporal_consistency=" +
+                    std::to_string(mnLoopNumCoincidences) + "/3";
+            cout << "HumanSLAM same-map Sim3 verified; " << detail << endl;
+            EventLogger::Instance().Log(
+                mpCurrentKF ? mpCurrentKF->mnFrameId : -1,
+                mpCurrentKF ? mpCurrentKF->mTimeStamp : -1.0,
+                "LoopClosing",
+                "HUMANSLAM_SIM3_VERIFIED",
+                detail);
+        }
     }
     // Merge candidates
     if(!bMergeDetectedInKF && !vpMergeBowCand.empty())

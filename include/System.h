@@ -193,6 +193,7 @@ public:
         const std::vector<long unsigned int> &mapIds,
         const std::vector<long unsigned int> &keyFrameIds,
         const std::vector<float> &scores);
+    void SetSemanticCandidatesOnly(bool enabled);
 
     // For debugging
     double GetTimeFromIMUInit();

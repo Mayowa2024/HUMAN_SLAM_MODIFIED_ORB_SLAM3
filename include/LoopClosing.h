@@ -31,6 +31,7 @@
 #include <boost/algorithm/string.hpp>
 #include <thread>
 #include <mutex>
+#include <chrono>
 #include "Thirdparty/g2o/g2o/types/types_seven_dof_expmap.h"
 
 namespace ORB_SLAM3
@@ -68,6 +69,8 @@ public:
         const std::vector<long unsigned int> &mapIds,
         const std::vector<long unsigned int> &keyFrameIds,
         const std::vector<float> &scores);
+
+    void SetSemanticCandidatesOnly(bool enabled);
 
     void RequestReset();
     void RequestResetActiveMap(Map* pMap);
@@ -174,16 +177,22 @@ protected:
 
     std::mutex mMutexLoopQueue;
 
-    struct SemanticMergeProposal
+    struct SemanticPlaceProposal
     {
         long unsigned int queryKeyFrameId;
         std::vector<long unsigned int> mapIds;
         std::vector<long unsigned int> keyFrameIds;
         std::vector<float> scores;
     };
-    std::list<SemanticMergeProposal> mlSemanticMergeProposals;
+    std::list<SemanticPlaceProposal> mlSemanticMergeProposals;
     std::mutex mMutexSemanticMerge;
     bool mbSemanticMergeInProgress;
+    bool mbSemanticLoopInProgress;
+    bool mbSemanticCandidatesOnly;
+    bool mbLoopTimingActive;
+    std::chrono::steady_clock::time_point mLoopTimingStart;
+    std::string mSemanticLoopSource;
+    std::vector<long unsigned int> mvSemanticLoopRootIds;
 
     // Loop detector parameters
     float mnCovisibilityConsistencyTh;

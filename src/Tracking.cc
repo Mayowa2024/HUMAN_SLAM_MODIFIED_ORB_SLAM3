@@ -2377,6 +2377,8 @@ void Tracking::Track()
             mlRelativeFramePoses.push_back(Tcr_);
             mlpReferences.push_back(mCurrentFrame.mpReferenceKF);
             mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
+            mlFrameIds.push_back(mCurrentFrame.mnId);
+            mlFrameNames.push_back(mCurrentFrame.mNameFile);
             mlbLost.push_back(mState==LOST);
         }
         else
@@ -2384,7 +2386,9 @@ void Tracking::Track()
             // This can happen if tracking is lost
             mlRelativeFramePoses.push_back(mlRelativeFramePoses.back());
             mlpReferences.push_back(mlpReferences.back());
-            mlFrameTimes.push_back(mlFrameTimes.back());
+            mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
+            mlFrameIds.push_back(mCurrentFrame.mnId);
+            mlFrameNames.push_back(mCurrentFrame.mNameFile);
             mlbLost.push_back(mState==LOST);
         }
 
@@ -2733,7 +2737,21 @@ void Tracking::CreateInitialMapMonocular()
 void Tracking::CreateMapInAtlas()
 {
     mnLastInitFrameId = mCurrentFrame.mnId;
+    Map* previousMap = mpAtlas->GetCurrentMap();
+    const long long previousMapId = previousMap ?
+        static_cast<long long>(previousMap->GetId()) : -1;
     mpAtlas->CreateNewMap();
+    Map* newMap = mpAtlas->GetCurrentMap();
+    const long long newMapId = newMap ?
+        static_cast<long long>(newMap->GetId()) : -1;
+    EventLogger::Instance().Log(
+        mCurrentFrame.mnId,
+        mCurrentFrame.mTimeStamp,
+        "Tracking",
+        "MAP_CREATED",
+        "source=tracking_create_map;previous_map=" + std::to_string(previousMapId) +
+        ";new_map=" + std::to_string(newMapId)
+    );
     if (mSensor==System::IMU_STEREO || mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_RGBD)
         mpAtlas->SetInertialSensor();
     mbSetInit=false;
@@ -3709,7 +3727,7 @@ bool Tracking::Relocalization()
     mCurrentFrame.mTimeStamp,
     "Tracking",
     "RELOCALIZATION_ATTEMPT",
-    "Starting BoW relocalization"
+    "source_search=humanslam+native_bow"
     );
     // Compute Bag of Words Vector
     mCurrentFrame.ComputeBoW();
@@ -3769,6 +3787,18 @@ bool Tracking::Relocalization()
            vpCandidateKFs.end())
             vpCandidateKFs.push_back(keyFrame);
     }
+
+    EventLogger::Instance().Log(
+        mCurrentFrame.mnId,
+        mCurrentFrame.mTimeStamp,
+        "Tracking",
+        "RELOCALIZATION_CANDIDATE_SOURCES",
+        "semantic_query_frame=" + std::to_string(semanticQueryFrameId) +
+        ";semantic_fresh=" + std::to_string(semanticResponseIsFresh ? 1 : 0) +
+        ";semantic_candidates=" + std::to_string(semanticScores.size()) +
+        ";native_bow_candidates=" + std::to_string(bowCandidates.size()) +
+        ";combined_candidates=" + std::to_string(vpCandidateKFs.size())
+    );
 
     if(vpCandidateKFs.empty()) {
         Verbose::PrintMess("There are not candidates", Verbose::VERBOSITY_NORMAL);
@@ -3845,6 +3875,7 @@ bool Tracking::Relocalization()
     bool bMatch = false;
     KeyFrame* pMatchedKeyFrame = nullptr;
     float matchedSemanticScore = 0.0f;
+    int matchedInliers = 0;
     ORBmatcher matcher2(0.9,true);
 
     while(nCandidates>0 && !bMatch)
@@ -3941,6 +3972,7 @@ bool Tracking::Relocalization()
                     bMatch = true;
                     pMatchedKeyFrame = vpCandidateKFs[i];
                     matchedSemanticScore = vSemanticScores[i];
+                    matchedInliers = nGood;
                     break;
                 }
             }
@@ -3978,7 +4010,18 @@ bool Tracking::Relocalization()
         mCurrentFrame.mTimeStamp,
         "Tracking",
         "RELOCALIZATION_SUCCESS",
-        "mnLastRelocFrameId=" + std::to_string(mnLastRelocFrameId)
+        "source=" + std::string(matchedSemanticScore > 0.0f ?
+                                  "humanslam" : "native_bow") +
+        ";query_frame=" + std::to_string(mCurrentFrame.mnId) +
+        ";semantic_query_frame=" + std::to_string(semanticQueryFrameId) +
+        ";candidate_keyframe=" +
+            std::to_string(pMatchedKeyFrame ? pMatchedKeyFrame->mnId : -1) +
+        ";candidate_map=" +
+            std::to_string((pMatchedKeyFrame && pMatchedKeyFrame->GetMap()) ?
+                               pMatchedKeyFrame->GetMap()->GetId() : -1) +
+        ";semantic_score=" + std::to_string(matchedSemanticScore) +
+        ";inliers=" + std::to_string(matchedInliers) +
+        ";mnLastRelocFrameId=" + std::to_string(mnLastRelocFrameId)
         );
         return true;
     }
@@ -4032,6 +4075,8 @@ void Tracking::Reset(bool bLocMap)
     mlRelativeFramePoses.clear();
     mlpReferences.clear();
     mlFrameTimes.clear();
+    mlFrameIds.clear();
+    mlFrameNames.clear();
     mlbLost.clear();
     mCurrentFrame = Frame();
     mnLastRelocFrameId = 0;

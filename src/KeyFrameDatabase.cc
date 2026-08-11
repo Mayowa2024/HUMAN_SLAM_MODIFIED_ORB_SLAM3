@@ -601,8 +601,17 @@ bool compFirst(const pair<float, KeyFrame*> & a, const pair<float, KeyFrame*> & 
 }
 
 
-void KeyFrameDatabase::DetectNBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &vpLoopCand, vector<KeyFrame*> &vpMergeCand, int nNumCandidates)
+void KeyFrameDatabase::DetectNBestCandidates(KeyFrame *pKF,
+                                              vector<KeyFrame*> &vpLoopCand,
+                                              vector<KeyFrame*> &vpMergeCand,
+                                              int nNumCandidates,
+                                              vector<float>* pvLoopScores,
+                                              vector<float>* pvMergeScores)
 {
+    if(pvLoopScores)
+        pvLoopScores->clear();
+    if(pvMergeScores)
+        pvMergeScores->clear();
     list<KeyFrame*> lKFsSharingWords;
     set<KeyFrame*> spConnectedKF;
 
@@ -717,10 +726,14 @@ void KeyFrameDatabase::DetectNBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &v
             if(pKF->GetMap() == pKFi->GetMap() && vpLoopCand.size() < nNumCandidates)
             {
                 vpLoopCand.push_back(pKFi);
+                if(pvLoopScores)
+                    pvLoopScores->push_back(it->first);
             }
             else if(pKF->GetMap() != pKFi->GetMap() && vpMergeCand.size() < nNumCandidates && !pKFi->GetMap()->IsBad())
             {
                 vpMergeCand.push_back(pKFi);
+                if(pvMergeScores)
+                    pvMergeScores->push_back(it->first);
             }
             spAlreadyAddedKF.insert(pKFi);
         }

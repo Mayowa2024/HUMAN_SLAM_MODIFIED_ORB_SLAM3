@@ -1212,16 +1212,37 @@ void System::SaveTrajectoryKITTI(const string &filename)
         return;
     }
 
-    vector<KeyFrame*> vpKFs = mpAtlas->GetAllKeyFrames();
+    vector<KeyFrame*> vpKFs;
+    for(Map* pMap : mpAtlas->GetAllMaps())
+    {
+        if(!pMap)
+            continue;
+        const vector<KeyFrame*> mapKeyFrames = pMap->GetAllKeyFrames();
+        vpKFs.insert(vpKFs.end(), mapKeyFrames.begin(), mapKeyFrames.end());
+    }
     sort(vpKFs.begin(),vpKFs.end(),KeyFrame::lId);
 
-    // Transform all keyframes so that the first keyframe is at the origin.
-    // After a loop closure the first keyframe might not be at the origin.
-    Sophus::SE3f Tow = vpKFs[0]->GetPoseInverse();
+    if(vpKFs.empty())
+    {
+        cerr << "ERROR: no keyframes available for KITTI trajectory export." << endl;
+        ofstream empty(filename.c_str());
+        const size_t separator = filename.find_last_of("/\\");
+        const string outputDirectory = separator == string::npos
+            ? string() : filename.substr(0, separator + 1);
+        ofstream emptyIndex((outputDirectory + "trajectory_frame_ids.csv").c_str());
+        emptyIndex << "trajectory_row,frame_id,source_frame_id,dataset_time,map_id\n";
+        return;
+    }
 
     ofstream f;
     f.open(filename.c_str());
     f << fixed;
+
+    const size_t separator = filename.find_last_of("/\\");
+    const string outputDirectory = separator == string::npos
+        ? string() : filename.substr(0, separator + 1);
+    ofstream frameIndex((outputDirectory + "trajectory_frame_ids.csv").c_str());
+    frameIndex << "trajectory_row,frame_id,source_frame_id,dataset_time,map_id\n";
 
     // Frame pose is stored relative to its reference keyframe (which is optimized by BA and pose graph).
     // We need to get first the keyframe pose and then concatenate the relative transformation.
@@ -1231,21 +1252,42 @@ void System::SaveTrajectoryKITTI(const string &filename)
     // which is true when tracking failed (lbL).
     list<ORB_SLAM3::KeyFrame*>::iterator lRit = mpTracker->mlpReferences.begin();
     list<double>::iterator lT = mpTracker->mlFrameTimes.begin();
+    list<long unsigned int>::iterator lFrameId = mpTracker->mlFrameIds.begin();
+    list<string>::iterator lFrameName = mpTracker->mlFrameNames.begin();
+    size_t trajectoryRow = 0;
     for(list<Sophus::SE3f>::iterator lit=mpTracker->mlRelativeFramePoses.begin(),
-        lend=mpTracker->mlRelativeFramePoses.end();lit!=lend;lit++, lRit++, lT++)
+        lend=mpTracker->mlRelativeFramePoses.end();
+        lit!=lend && lRit!=mpTracker->mlpReferences.end() &&
+        lT!=mpTracker->mlFrameTimes.end() && lFrameId!=mpTracker->mlFrameIds.end() &&
+        lFrameName!=mpTracker->mlFrameNames.end();
+        lit++, lRit++, lT++, lFrameId++, lFrameName++)
     {
         ORB_SLAM3::KeyFrame* pKF = *lRit;
 
-        Sophus::SE3f Trw;
+        Sophus::SE3f Trw = Sophus::SE3f();
 
         if(!pKF)
             continue;
 
-        while(pKF->isBad())
+        while(pKF && pKF->isBad())
         {
             Trw = Trw * pKF->mTcp;
             pKF = pKF->GetParent();
         }
+
+        if(!pKF || !pKF->GetMap())
+            continue;
+
+        Map* pMap = pKF->GetMap();
+        KeyFrame* pOriginKF = pMap->GetOriginKF();
+        if(!pOriginKF)
+            continue;
+
+        // Each unmerged Atlas map has its own coordinate system. Anchor a
+        // frame to the origin of the map containing its reference keyframe;
+        // the companion index records map_id so evaluators never concatenate
+        // independent maps as if they shared a global frame.
+        const Sophus::SE3f Tow = pOriginKF->GetPoseInverse();
 
         Trw = Trw * pKF->GetPose() * Tow;
 
@@ -1257,8 +1299,11 @@ void System::SaveTrajectoryKITTI(const string &filename)
         f << setprecision(9) << Rwc(0,0) << " " << Rwc(0,1)  << " " << Rwc(0,2) << " "  << twc(0) << " " <<
              Rwc(1,0) << " " << Rwc(1,1)  << " " << Rwc(1,2) << " "  << twc(1) << " " <<
              Rwc(2,0) << " " << Rwc(2,1)  << " " << Rwc(2,2) << " "  << twc(2) << endl;
+        frameIndex << trajectoryRow++ << ',' << *lFrameId << ',' << *lFrameName << ','
+                   << setprecision(9) << *lT << ',' << pMap->GetId() << '\n';
     }
     f.close();
+    frameIndex.close();
 }
 
 
@@ -1371,6 +1416,12 @@ void System::SubmitSemanticCandidates(
     mpTracker->SubmitSemanticCandidates(queryFrameId, candidates);
     mpLoopCloser->SubmitSemanticMergeCandidates(
         queryReferenceKeyFrameId, mapIds, keyFrameIds, scores);
+}
+
+void System::SetSemanticCandidatesOnly(bool enabled)
+{
+    if(mpLoopCloser)
+        mpLoopCloser->SetSemanticCandidatesOnly(enabled);
 }
 
 vector<MapPoint*> System::GetTrackedMapPoints()
